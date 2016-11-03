@@ -205,7 +205,7 @@ func (cmd *cmdSync) SyncRDBFile(reader *bufio.Reader, target, passwd string, nsi
 						cmd.ignore.Incr()
 					} else {
 						cmd.nentry.Incr()
-						if uint32(args.specifydb) != e.DB{
+						if args.specifydb != -1 && uint32(args.specifydb) != e.DB{
 							e.DB = uint32(args.specifydb)
 						}
 						if e.DB != lastdb {
