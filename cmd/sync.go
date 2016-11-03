@@ -205,8 +205,8 @@ func (cmd *cmdSync) SyncRDBFile(reader *bufio.Reader, target, passwd string, nsi
 						cmd.ignore.Incr()
 					} else {
 						cmd.nentry.Incr()
-						if args.specifydb != e.DB{
-							e.DB = args.specifydb
+						if uint32(args.specifydb) != e.DB{
+							e.DB = uint32(args.specifydb)
 						}
 						if e.DB != lastdb {
 							lastdb = e.DB
@@ -273,7 +273,7 @@ func (cmd *cmdSync) SyncCommand(reader *bufio.Reader, target, passwd string) {
 					}
 					bypass = !acceptDB(uint32(n))
 					if !bypass {
- 						if specifydb != uint32(n){
+ 						if specifydb != n{
  							resp = redis.NewCommand(scmd,specifydb);
  						}
  					}
