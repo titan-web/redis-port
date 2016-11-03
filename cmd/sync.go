@@ -205,13 +205,12 @@ func (cmd *cmdSync) SyncRDBFile(reader *bufio.Reader, target, passwd string, nsi
 						cmd.ignore.Incr()
 					} else {
 						cmd.nentry.Incr()
-						if args.specifydb >= 0 {
-							selectDB(c, uint32(args.specifydb))
-						}else{
-							if e.DB != lastdb {
-								lastdb = e.DB
-								selectDB(c, lastdb)
-							}
+						if args.specifydb != e.DB{
+							e.DB = args.specifydb
+						}
+						if e.DB != lastdb {
+							lastdb = e.DB
+							selectDB(c, lastdb)
 						}
 						restoreRdbEntry(c, e, args.restorecmd)
 					}
@@ -240,7 +239,7 @@ func (cmd *cmdSync) SyncRDBFile(reader *bufio.Reader, target, passwd string, nsi
 	}
 	log.Info("sync rdb done")
 }
-// TODO specifydb
+
 func (cmd *cmdSync) SyncCommand(reader *bufio.Reader, target, passwd string) {
 	c := openNetConn(target, passwd)
 	defer c.Close()
@@ -257,6 +256,7 @@ func (cmd *cmdSync) SyncCommand(reader *bufio.Reader, target, passwd string) {
 
 	go func() {
 		var bypass bool = false
+		specifydb := args.specifydb
 		for {
 			resp := redis.MustDecode(reader)
 			if scmd, args, err := redis.ParseArgs(resp); err != nil {
@@ -272,6 +272,11 @@ func (cmd *cmdSync) SyncCommand(reader *bufio.Reader, target, passwd string) {
 						log.PanicErrorf(err, "parse db = %s failed", s)
 					}
 					bypass = !acceptDB(uint32(n))
+					if !bypass {
+ 						if specifydb != uint32(n){
+ 							resp = redis.NewCommand(scmd,specifydb);
+ 						}
+ 					}
 				}
 				if bypass || is_cmd_blacklist(scmd){
 					cmd.nbypass.Incr()
