@@ -273,7 +273,7 @@ func (cmd *cmdSync) SyncCommand(reader *bufio.Reader, target, passwd string) {
 					}
 					bypass = !acceptDB(uint32(n))
 					if !bypass {
- 						if specifydb != n{
+ 						if specifydb != -1 && specifydb != n{
  							resp = redis.NewCommand(scmd,specifydb);
  						}
  					}
