@@ -276,7 +276,7 @@ func newRDBLoader(reader *bufio.Reader, rbytes *atomic2.Int64, size int) chan *r
 }
 
 func is_cmd_blacklist(scmd string) bool {
-	black_list := []string{"ping", "publish"}
+	black_list := []string{"ping", "publish", "multi", "pttl", "dump", "exec"}
 
 	for _, v := range black_list{
 		if v == scmd{
