@@ -139,7 +139,7 @@ Options:
 	if s, ok := d["--restorecmd"].(string); ok && s != "" {
 		args.restorecmd = s
 	}else {
-		args.restorecmd = "slosrestore"
+		args.restorecmd = "slotsrestore"
 	}
 
 	if s, ok := d["--faketime"].(string); ok && s != "" {
