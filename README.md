@@ -8,25 +8,33 @@ parse redis rdb file, sync data between redis master and slave
 * **DECODE** dumped payload to human readable format (hex-encoding)
 
 ```sh
-redis-port decode   [--ncpu=N]  [--input=INPUT]  [--output=OUTPUT]
+redis-port decode    [--ncpu=N] [--parallel=M] \
+    [--input=INPUT] \
+    [--output=OUTPUT]
 ```
 
 * **RESTORE** rdb file to target redis
 
 ```sh
-redis-port restore  [--ncpu=N]  [--input=INPUT]   --target=TARGET  [--auth=AUTH]   [--extra]  [--faketime=FAKETIME]  [--filterdb=DB]
+redis-port restore   [--ncpu=N] [--parallel=M] \
+    [--input=INPUT]  [--faketime=FAKETIME] [--extra] [--filterdb=DB] \
+     --target=TARGET [--auth=AUTH] [--redis|--codis]
 ```
 
 * **DUMP** rdb file from master redis
 
 ```sh
-redis-port dump     [--ncpu=N]   --from=MASTER   [--password=PASSWORD]  [--output=OUTPUT]  [--extra]
+redis-port dump      [--ncpu=N] [--parallel=M] \
+     --from=MASTER   [--password=PASSWORD] [--extra] \
+    [--output=OUTPUT]
 ```
 
 * **SYNC** data from master to slave
 
 ```sh
-redis-port sync     [--ncpu=N]   --from=MASTER   [--password=PASSWORD]  --target=TARGET  [--auth=AUTH]  [--sockfile=FILE [--filesize=SIZE]]  [--filterdb=DB]  [--specifydb=TDB] [--restorecmd=slotsrestore] [--psync]
+redis-port sync      [--ncpu=N] [--parallel=M] \
+     --from=MASTER   [--password=PASSWORD] [--psync] [--filterdb=DB] \
+     --target=TARGET [--auth=AUTH] [--redis|--codis] [--sockfile=FILE [--filesize=SIZE]]
 ```
 
 Options
@@ -34,6 +42,10 @@ Options
 + -n _N_, --ncpu=_N_
 
 > set runtime.GOMAXPROCS to _N_
+
++ -p _M_, --parallel=_M_
+
+> set number of parallel routines
 
 + -i _INPUT_, --input=_INPUT_
 
@@ -63,17 +75,17 @@ Options
 
 > dump or restore following redis backlog commands
 
++ --redis
+
+> target is normal redis instance, default value is **false**.
+
++ --codis
+
+> target is codis proxy, default value is **true**.
+
 + --filterdb=DB
 
 > filter specifed db number, default value is '*'
-
-+ --specifydb=TDB
-
-> Specify target db number, default value is *.
-
-+ --restorecmd=slotsrestore
-
-> Restore command, `slotsrestore` for codis, `restore` for redis
 
 Examples
 -------
@@ -82,14 +94,14 @@ Examples
 
 ```sh
 $ cat dump.rdb | ./redis-port decode 2>/dev/null
-  {"db":0,"type":"string","expireat":0,"key":"a","key64":"YQ==","value64":"MTAwMDA="}
-  {"db":0,"type":"string","expireat":0,"key":"b","key64":"Yg==","value64":"aGVsbG8ud29ybGQ="}
-  {"db":0,"type":"hash","expireat":0,"key":"c","key64":"Yw==","field":"c1","field64":"YzE=","member64":"MTAw"
-  {"db":0,"type":"hash","expireat":0,"key":"c","key64":"Yw==","field":"c2","field64":"YzI=","member64":"dGVzdC5zdHJpbmc="}
-  {"db":0,"type":"list","expireat":0,"key":"d","key64":"ZA==","index":0,"value64":"bDE="}
-  {"db":0,"type":"list","expireat":0,"key":"d","key64":"ZA==","index":1,"value64":"bDI="}
-  {"db":0,"type":"zset","expireat":0,"key":"e","key64":"ZQ==","member":"e1","member64":"ZTE=","score":1.000000}
-  {"db":0,"type":"zset","expireat":0,"key":"e","key64":"ZQ==","member":"e2","member64":"ZTI=","score":2.000000}
+ {"db":0,"type":"string","key":"a","value":"hello"}
+ {"db":1,"type":"string","key":"a","value":"9"}
+ {"db":0,"type":"hash","key":"c","field":"hello","value":"world"}
+ {"db":0,"type":"expire","key":"c","expireat":1487663341422}
+ {"db":0,"type":"list","key":"b","index":0,"value":"hello"}
+ {"db":0,"type":"list","key":"b","index":1,"value":"world"}
+ {"db":0,"type":"zset","key":"d","member":"hello","score":1}
+ {"db":0,"type":"zset","key":"d","member":"world","score":1.8}
   ... ...
 ```
 

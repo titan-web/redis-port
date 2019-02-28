@@ -1,114 +1,186 @@
-// Copyright 2016 CodisLabs. All Rights Reserved.
-// Licensed under the MIT (MIT-LICENSE.txt) license.
-
 package main
 
 import (
 	"bufio"
+	"bytes"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/CodisLabs/redis-port/pkg/libs/atomic2"
-	"github.com/CodisLabs/redis-port/pkg/libs/log"
+	"github.com/CodisLabs/codis/pkg/utils/bufio2"
+	"github.com/CodisLabs/codis/pkg/utils/bytesize"
+	"github.com/CodisLabs/codis/pkg/utils/log"
+	"github.com/CodisLabs/codis/pkg/utils/sync2/atomic2"
 )
 
-type cmdDump struct {
-}
+func main() {
+	const usage = `
+Usage:
+	redis-dump [--ncpu=N] (--master=MASTER|MASTER) [--output=OUTPUT] [--aof=FILE]
+	redis-dump  --version
 
-func (cmd *cmdDump) Main() {
-	from, output := args.from, args.output
-	if len(from) == 0 {
-		log.Panic("invalid argument: from")
+Options:
+	-n N, --ncpu=N                    Set runtime.GOMAXPROCS to N.
+	-m MASTER, --master=MASTER        The master redis instance ([auth@]host:port).
+	-o OUTPUT, --output=OUTPUT        Set output file. [default: /dev/stdout].
+	-a FILE, --aof=FILE               Also dump the replication backlog.
+
+Examples:
+	$ redis-dump    127.0.0.1:6379 -o dump.rdb
+	$ redis-dump    127.0.0.1:6379 -o dump.rdb -a
+	$ redis-dump -m passwd@192.168.0.1:6380 -o dump.rdb -a dump.aof
+`
+	var flags = parseFlags(usage)
+
+	var master struct {
+		Path       string
+		Addr, Auth string
+		net.Conn
+		rd *bufio2.Reader
+		wt *bufio2.Writer
 	}
-	if len(output) == 0 {
-		output = "/dev/stdout"
+	master.Path = flags.Source
+	if len(master.Path) == 0 {
+		log.Panicf("invalid master address")
+	}
+	master.Addr, master.Auth = redisParsePath(master.Path)
+	if len(master.Addr) == 0 {
+		log.Panicf("invalid master address")
 	}
 
-	log.Infof("dump from '%s' to '%s'\n", from, output)
+	var output, aoflog struct {
+		Path string
+		io.Writer
+		wt *bufio.Writer
 
-	var dumpto io.WriteCloser
-	if output != "/dev/stdout" {
-		dumpto = openWriteFile(output)
-		defer dumpto.Close()
-	} else {
-		dumpto = os.Stdout
+		wbytes atomic2.Int64
 	}
+	output.Path = flags.Target
+	if len(output.Path) == 0 {
+		log.Panicf("invalid output file")
+	}
+	aoflog.Path = flags.AofPath
 
-	master, nsize := cmd.SendCmd(from, args.passwd)
+	log.Infof("dump: master = %q, output = %q, aoflog = %q\n", master.Path, output.Path, aoflog.Path)
+
+	master.Conn = openConn(master.Addr, master.Auth)
 	defer master.Close()
+	master.rd = rBuilder(master.Conn).Must().
+		Buffer2(ReaderBufferSize).Reader.(*bufio2.Reader)
+	master.wt = wBuilder(master.Conn).Must().
+		Buffer2(WriterBufferSize).Writer.(*bufio2.Writer)
 
-	log.Infof("rdb file = %d\n", nsize)
-
-	reader := bufio.NewReaderSize(master, ReaderBufferSize)
-	writer := bufio.NewWriterSize(dumpto, WriterBufferSize)
-
-	cmd.DumpRDBFile(reader, writer, nsize)
-
-	if !args.extra {
-		return
+	if output.Path != "/dev/stdout" {
+		file := openWriteFile(output.Path)
+		defer closeFile(file)
+		output.Writer = file
+	} else {
+		output.Writer = os.Stdout
 	}
+	output.wt = wBuilder(output.Writer).Must().
+		Count(&output.wbytes).Buffer(WriterBufferSize).Writer.(*bufio.Writer)
 
-	cmd.DumpCommand(reader, writer, nsize)
-}
-
-func (cmd *cmdDump) SendCmd(master, passwd string) (net.Conn, int64) {
-	c, wait := openSyncConn(master, passwd)
-	var nsize int64
-	for nsize == 0 {
-		select {
-		case nsize = <-wait:
-			if nsize == 0 {
-				log.Info("+")
-			}
-		case <-time.After(time.Second):
-			log.Info("-")
-		}
+	if aoflog.Path != "" {
+		file := openWriteFile(aoflog.Path)
+		defer closeFile(file)
+		aoflog.Writer = file
+	} else {
+		aoflog.Writer = ioutil.Discard
 	}
-	return c, nsize
-}
+	aoflog.wt = wBuilder(aoflog.Writer).Must().
+		Count(&aoflog.wbytes).Buffer(WriterBufferSize).Writer.(*bufio.Writer)
 
-func (cmd *cmdDump) DumpRDBFile(reader *bufio.Reader, writer *bufio.Writer, nsize int64) {
-	var nread atomic2.Int64
-	wait := make(chan struct{})
-	go func() {
-		defer close(wait)
-		p := make([]byte, WriterBufferSize)
-		for nsize != nread.Get() {
-			nstep := int(nsize - nread.Get())
-			ncopy := int64(iocopy(reader, writer, p, nstep))
-			nread.Add(ncopy)
-			flushWriter(writer)
-		}
-	}()
-
-	for done := false; !done; {
-		select {
-		case <-wait:
-			done = true
-		case <-time.After(time.Second):
-		}
-		n := nread.Get()
-		p := 100 * n / nsize
-		log.Infof("total = %d - %12d [%3d%%]\n", nsize, n, p)
-	}
-	log.Info("dump: rdb done")
-}
-
-func (cmd *cmdDump) DumpCommand(reader *bufio.Reader, writer *bufio.Writer, nsize int64) {
-	var nread atomic2.Int64
-	go func() {
-		p := make([]byte, ReaderBufferSize)
+	var runid, offset, rdbSizeChan = redisSendPsyncFullsync(master.rd, master.wt)
+	var rdbSize = func() int64 {
 		for {
-			ncopy := int64(iocopy(reader, writer, p, len(p)))
-			nread.Add(ncopy)
-			flushWriter(writer)
+			select {
+			case n := <-rdbSizeChan:
+				if n != 0 {
+					return n
+				}
+				log.Info("+")
+			case <-time.After(time.Second):
+				log.Info("-")
+			}
 		}
 	}()
+	log.Infof("dump: runid = %q, offset = %d", runid, offset)
+	log.Infof("dump: rdb file = %d (%s)\n", rdbSize,
+		bytesize.Int64(rdbSize).HumanString())
 
-	for {
-		time.Sleep(time.Second)
-		log.Infof("dump: total = %d\n", nsize+nread.Get())
-	}
+	var mu sync.Mutex
+
+	var jobs = NewJob(func() {
+		var (
+			rd = rBuilder(master.rd).Reader
+			wt = wBuilder(output.wt).Mutex(&mu).Writer
+		)
+		ioCopyN(wt, rd, rdbSize)
+	}).Then(func() {
+		if aoflog.Path == "" {
+			return
+		}
+		var (
+			rd = rBuilder(master.rd).Reader
+			wt = wBuilder(aoflog.wt).Mutex(&mu).Writer
+		)
+		ioCopyBuffer(wt, rd)
+	}).Run()
+
+	var done = NewJob(func() {
+		for stop := false; !stop; {
+			select {
+			case <-jobs:
+				stop = true
+			case <-time.After(time.Second):
+				redisSendReplAck(master.wt, offset+aoflog.wbytes.Int64())
+			}
+			synchronized(&mu, func() {
+				flushWriter(output.wt)
+			})
+			synchronized(&mu, func() {
+				flushWriter(aoflog.wt)
+			})
+		}
+	}).Run()
+
+	log.Infof("dump: (w,a) = (rdb,aof)")
+
+	NewJob(func() {
+		for stop := false; !stop; {
+			select {
+			case <-done:
+				stop = true
+			case <-time.After(time.Second):
+			}
+			stats := &struct {
+				output, aoflog int64
+			}{
+				output.wbytes.Int64(),
+				aoflog.wbytes.Int64(),
+			}
+
+			var b bytes.Buffer
+			var percent float64
+			if rdbSize != 0 {
+				percent = float64(stats.output) * 100 / float64(rdbSize)
+			}
+			if rdbSize >= stats.output {
+				fmt.Fprintf(&b, "dump: rdb = %d - [%6.2f%%]", rdbSize, percent)
+			} else {
+				fmt.Fprintf(&b, "dump: rdb = %d", rdbSize)
+			}
+			fmt.Fprintf(&b, "   (w,a)=%s",
+				formatAlign(4, "(%d,%d)", stats.output, stats.aoflog))
+			fmt.Fprintf(&b, "  ~  (%s,%s)",
+				bytesize.Int64(stats.output).HumanString(), bytesize.Int64(stats.aoflog).HumanString())
+			log.Info(b.String())
+		}
+	}).RunAndWait()
+
+	log.Info("dump: done")
 }

@@ -2,12 +2,14 @@
 *.rdb
 *.swp
 *.out
+*.aof
 *.dump
 *.log.*
 
 .DS_Store
 
 /Godeps/_workspace
+/cmd/version.go
 .htaccess
 
 /bin

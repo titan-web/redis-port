@@ -1,360 +1,431 @@
-// Copyright 2016 CodisLabs. All Rights Reserved.
-// Licensed under the MIT (MIT-LICENSE.txt) license.
-
-package rdb
+package rdb_test
 
 import (
 	"bytes"
-	"encoding/hex"
-	"fmt"
+	"io/ioutil"
 	"math"
+	"path/filepath"
+	"sort"
 	"strconv"
-	"strings"
 	"testing"
+	"time"
 
-	"github.com/CodisLabs/redis-port/pkg/libs/assert"
+	"github.com/CodisLabs/redis-port/pkg/rdb"
+
+	"github.com/CodisLabs/codis/pkg/utils/assert"
+	"github.com/CodisLabs/codis/pkg/utils/log"
 )
 
-func DecodeHexRdb(t *testing.T, s string, n int) map[string]*BinEntry {
-	p, err := hex.DecodeString(strings.NewReplacer("\t", "", "\r", "", "\n", "", " ", "").Replace(s))
-	assert.MustNoError(err)
-	r := bytes.NewReader(p)
-	l := NewLoader(r)
-	assert.MustNoError(l.Header())
-	entries := make(map[string]*BinEntry)
-	var i int = 0
-	for {
-		e, err := l.NextBinEntry()
-		assert.MustNoError(err)
-		if e == nil {
-			break
+func newLoaderFromFile(path string) *rdb.Loader {
+	b, err := ioutil.ReadFile(filepath.Join("testing", path))
+	if err != nil {
+		log.PanicErrorf(err, "Read file %q failed.", path)
+	}
+	return rdb.NewLoader(bytes.NewReader(b))
+}
+
+type Database map[string]*rdb.DBEntry
+
+func (d Database) ValidateStringObject(key string, value string) {
+	assert.Must(d != nil)
+	assert.Must(d[key] != nil)
+	assert.Must(d[key].Value.IsString())
+	assert.Must(d[key].Value.AsString().String() == value)
+}
+
+func (d Database) ValidateListObject(key string, size int) []string {
+	assert.Must(d != nil)
+	assert.Must(d[key] != nil)
+	assert.Must(d[key].Value.IsList())
+	assert.Must(d[key].Value.AsList().Len() == size)
+	return d[key].Value.AsList().Strings()
+}
+
+func (d Database) ValidateHashObject(key string, size int) map[string]string {
+	assert.Must(d != nil)
+	assert.Must(d[key] != nil)
+	assert.Must(d[key].Value.IsHash())
+	assert.Must(d[key].Value.AsHash().Len() == size)
+	return d[key].Value.AsHash().Map()
+}
+
+func (d Database) ValidateZsetObject(key string, size int) map[string]float64 {
+	assert.Must(d != nil)
+	assert.Must(d[key] != nil)
+	assert.Must(d[key].Value.IsZset())
+	assert.Must(d[key].Value.AsZset().Len() == size)
+	return d[key].Value.AsZset().Map()
+}
+
+func (d Database) ValidateSetObject(key string, size int) map[string]bool {
+	assert.Must(d != nil)
+	assert.Must(d[key] != nil)
+	assert.Must(d[key].Value.IsSet())
+	assert.Must(d[key].Value.AsSet().Len() == size)
+	return d[key].Value.AsSet().Map()
+}
+
+type DatabaseSet map[uint64]Database
+
+func (databases DatabaseSet) ValidateSize(expected map[uint64]int) {
+	assert.Must(len(databases) == len(expected))
+	for id, db := range databases {
+		assert.Must(len(db) == expected[id])
+	}
+}
+
+func loadFromLoader(loader *rdb.Loader) DatabaseSet {
+	databases := make(map[uint64]Database)
+	loader.Header()
+	loader.ForEach(func(e *rdb.DBEntry) bool {
+		db, ok := databases[e.DB]
+		if !ok {
+			db = make(map[string]*rdb.DBEntry)
+			databases[e.DB] = db
 		}
-		assert.Must(e.DB == 0)
-		entries[string(e.Key)] = e
-		i++
-	}
-	assert.MustNoError(l.Footer())
-	assert.Must(r.Len() == 0)
-	assert.Must(len(entries) == i && i == n)
-	return entries
+		assert.Must(db[e.Key.String()] == nil)
+		db[e.Key.String()] = e.IncrRefCount()
+		return true
+	})
+	loader.Footer()
+	return databases
 }
 
-func getobj(t *testing.T, entries map[string]*BinEntry, key string) (*BinEntry, interface{}) {
-	e := entries[key]
-	assert.Must(e != nil)
-	o, err := DecodeDump(e.Value)
-	assert.MustNoError(err)
-	return e, o
+func loadFromFile(name string) DatabaseSet {
+	return loadFromLoader(newLoaderFromFile(name))
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for i in 1 255 256 65535 65536 2147483647 2147483648 4294967295 4294967296 -2147483648; do
-	./redis-cli set string_${i} ${i}
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadIntString(t *testing.T) {
-	s := `
-		524544495330303036fe00000a737472696e675f323535c1ff00000873747269
-		6e675f31c0010011737472696e675f343239343936373239360a343239343936
-		373239360011737472696e675f343239343936373239350a3432393439363732
-		39350012737472696e675f2d32313437343833363438c200000080000c737472
-		696e675f3635353335c2ffff00000011737472696e675f323134373438333634
-		380a32313437343833363438000c737472696e675f3635353336c20000010000
-		0a737472696e675f323536c100010011737472696e675f323134373438333634
-		37c2ffffff7fffe49d9f131fb5c3b5
-	`
-	values := []int{1, 255, 256, 65535, 65536, 2147483647, 2147483648, 4294967295, 4294967296, -2147483648}
-	entries := DecodeHexRdb(t, s, len(values))
-	for _, value := range values {
-		key := fmt.Sprintf("string_%d", value)
-		_, obj := getobj(t, entries, key)
-		val := obj.(String)
-		assert.Must(bytes.Equal([]byte(val), []byte(strconv.Itoa(value))))
-	}
-}
-
-/*
-#!/bin/bash
-./redis-cli flushall
-./redis-cli set string_ttls string_ttls
-./redis-cli expireat string_ttls 1500000000
-./redis-cli set string_ttlms string_ttlms
-./redis-cli pexpireat string_ttlms 1500000000000
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadStringTTL(t *testing.T) {
-	s := `
-		524544495330303036fe00fc0098f73e5d010000000c737472696e675f74746c
-		6d730c737472696e675f74746c6d73fc0098f73e5d010000000b737472696e67
-		5f74746c730b737472696e675f74746c73ffd15acd935a3fe949
-	`
-	expireat := uint64(1500000000000)
-	entries := DecodeHexRdb(t, s, 2)
-	keys := []string{"string_ttls", "string_ttlms"}
-	for _, key := range keys {
-		e, obj := getobj(t, entries, key)
-		val := obj.(String)
-		assert.Must(bytes.Equal([]byte(val), []byte(key)))
-		assert.Must(e.ExpireAt == expireat)
-	}
-}
-
-/*
-#!/bin/bash
-s="01"
-for ((i=0;i<15;i++)); do
-    s=$s$s
-done
-./redis-cli flushall
-./redis-cli set string_long $s
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadLongString(t *testing.T) {
-	s := `
-		524544495330303036fe00000b737472696e675f6c6f6e67c342f28000010000
-		02303130e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff
-		01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0
-		ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01e0ff01
-		e0ff01e0ff01e0ff01e0ff01e03201013031ffdfdb02bd6d5da5e6
-	`
-	entries := DecodeHexRdb(t, s, 1)
-	_, obj := getobj(t, entries, "string_long")
-	val := []byte(obj.(String))
-	for i := 0; i < (1 << 15); i++ {
-		var c uint8 = '0'
-		if i%2 != 0 {
-			c = '1'
+func release(databases DatabaseSet) {
+	for _, db := range databases {
+		for _, e := range db {
+			e.DecrRefCount()
 		}
-		assert.Must(val[i] == c)
 	}
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for ((i=0;i<256;i++)); do
-    ./redis-cli rpush list_lzf 0
-    ./redis-cli rpush list_lzf 1
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadListZipmap(t *testing.T) {
-	s := `
-		524544495330303036fe000a086c6973745f6c7a66c31f440b040b0400000820
-		0306000200f102f202e0ff03e1ff07e1ff07e1d90701f2ffff6a1c2d51c02301
-		16
-	`
-	entries := DecodeHexRdb(t, s, 1)
-	_, obj := getobj(t, entries, "list_lzf")
-	val := obj.(List)
-	assert.Must(len(val) == 512)
-	for i := 0; i < 256; i++ {
-		var s string = "0"
-		if i%2 != 0 {
-			s = "1"
+func TestEmptyDatabase(t *testing.T) {
+	databases := loadFromFile("empty_database.rdb")
+	defer release(databases)
+	assert.Must(len(databases) == 0)
+}
+
+func TestEmptyDatabaseNoChecksum(t *testing.T) {
+	databases := loadFromFile("empty_database_nochecksum.rdb")
+	defer release(databases)
+	assert.Must(len(databases) == 0)
+}
+
+func TestMultipleDatabases(t *testing.T) {
+	databases := loadFromFile("multiple_databases.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1, 2: 1})
+	databases[0].ValidateStringObject("key_in_zeroth_database", "zero")
+	databases[2].ValidateStringObject("key_in_second_database", "second")
+}
+
+func TestIntegerKeys(t *testing.T) {
+	databases := loadFromFile("integer_keys.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 6})
+	databases[0].ValidateStringObject(
+		strconv.Itoa(125),
+		"Positive 8 bit integer")
+	databases[0].ValidateStringObject(
+		strconv.Itoa(0xABAB),
+		"Positive 16 bit integer")
+	databases[0].ValidateStringObject(
+		strconv.Itoa(0x0AEDD325),
+		"Positive 32 bit integer")
+	databases[0].ValidateStringObject(
+		strconv.Itoa(-123),
+		"Negative 8 bit integer")
+	databases[0].ValidateStringObject(
+		strconv.Itoa(-0x7325),
+		"Negative 16 bit integer")
+	databases[0].ValidateStringObject(
+		strconv.Itoa(-0x0AEDD325),
+		"Negative 32 bit integer")
+}
+
+func TestStringKeyWithCompression(t *testing.T) {
+	databases := loadFromFile("easily_compressible_string_key.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var key bytes.Buffer
+	for i := 0; i < 200; i++ {
+		key.WriteByte('a')
+	}
+	databases[0].ValidateStringObject(key.String(),
+		"Key that redis should compress easily")
+}
+
+func TestRdbVersion5WithChecksum(t *testing.T) {
+	databases := loadFromFile("rdb_version_5_with_checksum.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 6})
+	databases[0].ValidateStringObject(
+		"abcd", "efgh")
+	databases[0].ValidateStringObject(
+		"abc", "def")
+	databases[0].ValidateStringObject(
+		"foo", "bar")
+	databases[0].ValidateStringObject(
+		"bar", "baz")
+	databases[0].ValidateStringObject(
+		"abcdef", "abcdef")
+	databases[0].ValidateStringObject(
+		"longerstring", "thisisalongerstring.idontknowwhatitmeans")
+}
+
+func TestListAsLinkedList(t *testing.T) {
+	databases := loadFromFile("linkedlist.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var list = databases[0].ValidateListObject("force_linkedlist", 1000)
+	var contains = func(key string) bool {
+		for _, s := range list {
+			if s == key {
+				return true
+			}
 		}
-		assert.Must(string(val[i]) == s)
+		return false
+	}
+	assert.Must(contains("JYY4GIFI0ETHKP4VAJF5333082J4R1UPNPLE329YT0EYPGHSJQ"))
+	assert.Must(contains("TKBXHJOX9Q99ICF4V78XTCA2Y1UYW6ERL35JCIL1O0KSGXS58S"))
+}
+
+func TestListAsZiplistWithCompression(t *testing.T) {
+	databases := loadFromFile("ziplist_that_compresses_easily.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var list = databases[0].ValidateListObject("ziplist_compresses_easily", 6)
+	for i, length := range []int{6, 12, 18, 24, 30, 36} {
+		assert.Must(len(list[i]) == length)
+		for _, c := range list[i] {
+			assert.Must(c == 'a')
+		}
 	}
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for ((i=0;i<32;i++)); do
-    ./redis-cli rpush list ${i}
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadList(t *testing.T) {
-	s := `
-		524544495330303036fe0001046c69737420c000c001c002c003c004c005c006
-		c007c008c009c00ac00bc00cc00dc00ec00fc010c011c012c013c014c015c016
-		c017c018c019c01ac01bc01cc01dc01ec01fff756ea1fa90adefe3
-	`
-	entries := DecodeHexRdb(t, s, 1)
-	_, obj := getobj(t, entries, "list")
-	val := obj.(List)
-	assert.Must(len(val) == 32)
-	for i := 0; i < 32; i++ {
-		assert.Must(string(val[i]) == strconv.Itoa(i))
+func TestListAsZiplistWithoutCompression(t *testing.T) {
+	databases := loadFromFile("ziplist_that_doesnt_compress.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var list = databases[0].ValidateListObject("ziplist_doesnt_compress", 2)
+	sort.Strings(list)
+	assert.Must(list[0] == "aj2410")
+	assert.Must(list[1] == "cc953a17a8e096e76a44169ad3f9ac87c5f8248a403274416179aa9fbd852344")
+}
+
+func TestListAsZiplistWithIntegers(t *testing.T) {
+	databases := loadFromFile("ziplist_with_integers.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var list = databases[0].ValidateListObject("ziplist_with_integers", 24)
+	sort.Strings(list)
+	var expected []string
+	for i := 0; i < 13; i++ {
+		expected = append(expected, strconv.Itoa(i))
+	}
+	for _, v := range []int{
+		-2, 13, 25, -61, 63, 16380, -16000, 65535,
+		-65523, 4194304, 0x7fffffffffffffff} {
+		expected = append(expected, strconv.Itoa(v))
+	}
+	sort.Strings(expected)
+	for i := range list {
+		assert.Must(list[i] == expected[i])
 	}
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for ((i=0;i<16;i++)); do
-	./redis-cli sadd set1 ${i}
-done
-for ((i=0;i<32;i++)); do
-	./redis-cli sadd set2 ${i}
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadSetAndSetIntset(t *testing.T) {
-	s := `
-		524544495330303036fe0002047365743220c016c00dc01bc012c01ac004c014
-		c002c017c01dc01cc013c019c01ec008c006c000c001c007c00fc009c01fc00e
-		c003c00ac015c010c00bc018c011c00cc0050b04736574312802000000100000
-		0000000100020003000400050006000700080009000a000b000c000d000e000f
-		00ff3a0a9697324d19c3
-	`
-	entries := DecodeHexRdb(t, s, 2)
+func TestHashAsHashTable(t *testing.T) {
+	databases := loadFromFile("hash_table.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var hash = databases[0].ValidateHashObject("force_dictionary", 1000)
+	assert.Must(hash["ZMU5WEJDG7KU89AOG5LJT6K7HMNB3DEI43M6EYTJ83VRJ6XNXQ"] ==
+		"T63SOS8DQJF0Q0VJEZ0D1IQFCYTIPSBOUIAI9SB0OV57MQR1FI")
+	assert.Must(hash["UHS5ESW4HLK8XOGTM39IK1SJEUGVV9WOPK6JYA5QBZSJU84491"] ==
+		"6VULTCV52FXJ8MGVSFTZVAGK2JXZMGQ5F8OVJI0X6GEDDR27RZ")
+}
 
-	_, obj1 := getobj(t, entries, "set1")
-	val1 := obj1.(Set)
-	set1 := make(map[string]bool)
-	for _, mem := range val1 {
-		set1[string(mem)] = true
-	}
-	assert.Must(len(set1) == 16)
-	assert.Must(len(set1) == len(val1))
-	for i := 0; i < 16; i++ {
-		_, ok := set1[strconv.Itoa(i)]
-		assert.Must(ok)
-	}
+func TestHashAsZiplist(t *testing.T) {
+	databases := loadFromFile("hash_as_ziplist.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var hash = databases[0].ValidateHashObject("zipmap_compresses_easily", 3)
+	assert.Must(hash["a"] == "aa")
+	assert.Must(hash["aa"] == "aaaa")
+	assert.Must(hash["aaaaa"] == "aaaaaaaaaaaaaa")
+}
 
-	_, obj2 := getobj(t, entries, "set2")
-	val2 := obj2.(Set)
-	set2 := make(map[string]bool)
-	for _, mem := range val2 {
-		set2[string(mem)] = true
-	}
-	assert.Must(len(set2) == 32)
-	assert.Must(len(set2) == len(val2))
-	for i := 0; i < 32; i++ {
-		_, ok := set2[strconv.Itoa(i)]
-		assert.Must(ok)
+func TestHashAsZipmapWithCompression(t *testing.T) {
+	databases := loadFromFile("zipmap_that_compresses_easily.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var hash = databases[0].ValidateHashObject("zipmap_compresses_easily", 3)
+	assert.Must(hash["a"] == "aa")
+	assert.Must(hash["aa"] == "aaaa")
+	assert.Must(hash["aaaaa"] == "aaaaaaaaaaaaaa")
+}
+
+func TestHashAsZipmapWithoutCompression(t *testing.T) {
+	databases := loadFromFile("zipmap_that_doesnt_compress.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var hash = databases[0].ValidateHashObject("zimap_doesnt_compress", 2)
+	assert.Must(hash["MKD1G6"] == "2")
+	assert.Must(hash["YNNXK"] == "F7TI")
+}
+
+func TestHashAsZipmapWithBigValues(t *testing.T) {
+	databases := loadFromFile("zipmap_with_big_values.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var hash = databases[0].ValidateHashObject("zipmap_with_big_values", 5)
+	assert.Must(len(hash["253bytes"]) == 253)
+	assert.Must(len(hash["254bytes"]) == 254)
+	assert.Must(len(hash["255bytes"]) == 255)
+	assert.Must(len(hash["300bytes"]) == 300)
+	assert.Must(len(hash["20kbytes"]) == 20000)
+}
+
+func floatEqual(f1, f2 float64) bool {
+	return math.Abs(f1-f2) < 0.1
+}
+
+func TestZsetAsZiplist(t *testing.T) {
+	databases := loadFromFile("sorted_set_as_ziplist.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var zset = databases[0].ValidateZsetObject("sorted_set_as_ziplist", 3)
+	assert.Must(floatEqual(zset["8b6ba6718a786daefa69438148361901"], 1))
+	assert.Must(floatEqual(zset["cb7a24bb7528f934b841b34c3a73e0c7"], 2.37))
+	assert.Must(floatEqual(zset["523af537946b79c4f8369ed39ba78605"], 3.423))
+}
+
+func TestZsetRegularZset(t *testing.T) {
+	databases := loadFromFile("regular_sorted_set.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var zset = databases[0].ValidateZsetObject("force_sorted_set", 500)
+	assert.Must(floatEqual(zset["8URS19PINCX9H1H7UNBF6GWUPZEYCHYGERXAYVAUATVNM2GQRB"], 0.56))
+	assert.Must(floatEqual(zset["UH87QXHHKYH8CGD1NQLWOHPKD3YX5ONPOYAQTMAZAUFBGCFY0N"], 1.01))
+	assert.Must(floatEqual(zset["SKP3TXT7J6IZBRATLNVPUYV1KXU8WNA0SZCBLPCN20XO97SU3R"], 4.82))
+	assert.Must(floatEqual(zset["RJWIR8DLYDF39LG9LVVW68Y32XPIJ7ZD6JYQJHUOWZ34W8R533"], 0.5))
+	assert.Must(floatEqual(zset["HEAWIHTQWGDIBIJHM3SUHMO8WFBPWT8TBDQYREDLWOMV3KBIHA"], 3.14))
+}
+
+func TestSetIntset16(t *testing.T) {
+	databases := loadFromFile("intset_16.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var set = databases[0].ValidateSetObject("intset_16", 3)
+	for _, v := range []int{0x7ffe, 0x7ffd, 0x7ffc} {
+		assert.Must(set[strconv.Itoa(v)])
 	}
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for ((i=0;i<16;i++)); do
-	./redis-cli hset hash1 ${i}
-done
-for ((i=-16;i<16;i++)); do
-	./redis-cli hset hash2 ${i}
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadHashAndHashZiplist(t *testing.T) {
-	s := `
-		524544495330303036fe000405686173683220c00dc00dc0fcc0fcc0ffc0ffc0
-		04c004c002c002c0fbc0fbc0f0c0f0c0f9c0f9c008c008c0fac0fac006c006c0
-		00c000c001c001c0fec0fec007c007c0f6c0f6c00fc00fc009c009c0f7c0f7c0
-		fdc0fdc0f1c0f1c0f2c0f2c0f3c0f3c00ec00ec003c003c00ac00ac00bc00bc0
-		f8c0f8c00cc00cc0f5c0f5c0f4c0f4c005c0050d056861736831405151000000
-		4d000000200000f102f102f202f202f302f302f402f402f502f502f602f602f7
-		02f702f802f802f902f902fa02fa02fb02fb02fc02fc02fd02fd02fe0d03fe0d
-		03fe0e03fe0e03fe0f03fe0fffffa423d3036c15e534
-	`
-	entries := DecodeHexRdb(t, s, 2)
-
-	_, obj1 := getobj(t, entries, "hash1")
-	val1 := obj1.(Hash)
-	hash1 := make(map[string]string)
-	for _, ent := range val1 {
-		hash1[string(ent.Field)] = string(ent.Value)
-	}
-	assert.Must(len(hash1) == 16)
-	assert.Must(len(hash1) == len(val1))
-	for i := 0; i < 16; i++ {
-		s := strconv.Itoa(i)
-		assert.Must(hash1[s] == s)
-	}
-
-	_, obj2 := getobj(t, entries, "hash2")
-	val2 := obj2.(Hash)
-	hash2 := make(map[string]string)
-	for _, ent := range val2 {
-		hash2[string(ent.Field)] = string(ent.Value)
-	}
-	assert.Must(len(hash2) == 32)
-	assert.Must(len(hash2) == len(val2))
-	for i := -16; i < 16; i++ {
-		s := strconv.Itoa(i)
-		assert.Must(hash2[s] == s)
+func TestSetIntset32(t *testing.T) {
+	databases := loadFromFile("intset_32.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var set = databases[0].ValidateSetObject("intset_32", 3)
+	for _, v := range []int{0x7ffefffe, 0x7ffefffd, 0x7ffefffc} {
+		assert.Must(set[strconv.Itoa(v)])
 	}
 }
 
-/*
-#!/bin/bash
-./redis-cli flushall
-for ((i=0;i<16;i++)); do
-	./redis-cli zadd zset1 ${i} ${i}
-done
-for ((i=0;i<32;i++)); do
-	./redis-cli zadd zset2 -${i} ${i}
-done
-./redis-cli save && xxd -p -c 32 dump.rdb
-*/
-func TestLoadZSetAndZSetZiplist(t *testing.T) {
-	s := `
-		524544495330303036fe0003057a7365743220c016032d3232c00d032d3133c0
-		1b032d3237c012032d3138c01a032d3236c004022d34c014032d3230c002022d
-		32c017032d3233c01d032d3239c01c032d3238c013032d3139c019032d3235c0
-		1e032d3330c008022d38c006022d36c000022d30c001022d31c007022d37c009
-		022d39c00f032d3135c01f032d3331c00e032d3134c003022d33c00a032d3130
-		c015032d3231c010032d3136c00b032d3131c018032d3234c011032d3137c00c
-		032d3132c005022d350c057a736574314051510000004d000000200000f102f1
-		02f202f202f302f302f402f402f502f502f602f602f702f702f802f802f902f9
-		02fa02fa02fb02fb02fc02fc02fd02fd02fe0d03fe0d03fe0e03fe0e03fe0f03
-		fe0fffff2addedbf4f5a8f93
-	`
-	entries := DecodeHexRdb(t, s, 2)
+func TestSetIntset64(t *testing.T) {
+	databases := loadFromFile("intset_64.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var set = databases[0].ValidateSetObject("intset_64", 3)
+	for _, v := range []int{0x7ffefffefffefffe, 0x7ffefffefffefffd, 0x7ffefffefffefffc} {
+		assert.Must(set[strconv.Itoa(v)])
+	}
+}
 
-	_, obj1 := getobj(t, entries, "zset1")
-	val1 := obj1.(ZSet)
-	zset1 := make(map[string]float64)
-	for _, ent := range val1 {
-		zset1[string(ent.Member)] = ent.Score
+func TestSetRegularSet(t *testing.T) {
+	databases := loadFromFile("regular_set.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var set = databases[0].ValidateSetObject("regular_set", 6)
+	for _, key := range []string{"alpha", "beta", "gamma", "delta", "phi", "kappa"} {
+		assert.Must(set[key])
 	}
-	assert.Must(len(zset1) == 16)
-	assert.Must(len(zset1) == len(val1))
-	for i := 0; i < 16; i++ {
-		s := strconv.Itoa(i)
-		score, ok := zset1[s]
-		assert.Must(ok)
-		assert.Must(math.Abs(score-float64(i)) < 1e-10)
-	}
+}
 
-	_, obj2 := getobj(t, entries, "zset2")
-	val2 := obj2.(ZSet)
-	zset2 := make(map[string]float64)
-	for _, ent := range val2 {
-		zset2[string(ent.Member)] = ent.Score
+func TestNonASCIIValues(t *testing.T) {
+	databases := loadFromFile("non_ascii_values.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 6})
+	databases[0].ValidateStringObject("int_value", "123")
+	databases[0].ValidateStringObject("ascii", "\x00! ~0\n\t\rAb")
+	databases[0].ValidateStringObject("bin", "\x00$ ~0\u007f\xff\n\xaa\t\x80\rAb")
+	databases[0].ValidateStringObject("printable", "!+ Ab^~")
+	databases[0].ValidateStringObject("378", "int_key_name")
+	databases[0].ValidateStringObject("utf8", "\u05d1\u05d3\u05d9\u05e7\u05d4\U0001000f123\u05e2\u05d1\u05e8\u05d9\u05ea")
+}
+
+func TestRdbVersion8With64bLengthAndScores(t *testing.T) {
+	databases := loadFromFile("rdb_version_8_with_64b_length_and_scores.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 2})
+	databases[0].ValidateStringObject("foo", "bar")
+	var zset = databases[0].ValidateZsetObject("bigset", 1000)
+	assert.Must(floatEqual(zset["finalfield"], 2.718))
+}
+
+func TestUncompressibleStringKeys(t *testing.T) {
+	databases := loadFromFile("uncompressible_string_keys.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 3})
+}
+
+func TestKeysWithExpiry(t *testing.T) {
+	databases := loadFromFile("keys_with_expiry.rdb")
+	defer release(databases)
+	databases.ValidateSize(map[uint64]int{0: 1})
+	var entry = databases[0]["expires_ms_precision"]
+	assert.Must(entry != nil)
+	assert.Must(entry.Expire != rdb.NoExpire)
+	var expire = time.Unix(int64(entry.Expire/time.Second), int64(entry.Expire%time.Second))
+	var utc, _ = time.LoadLocation("UTC")
+	assert.Must(expire.In(utc).Format("2006-01-02 15:04:05.000000") == "2022-12-25 10:11:12.573000")
+}
+
+func TestListDecode(t *testing.T) {
+	databases := loadFromFile("list_decode.rdb")
+	defer release(databases)
+	var list = databases[0].ValidateListObject("list", 1000*1000)
+	for i := 0; i < 1000*1000; i++ {
+		assert.Must(list[i] == strconv.Itoa(i))
 	}
-	assert.Must(len(zset2) == 32)
-	assert.Must(len(zset2) == len(val2))
-	for i := 0; i < 32; i++ {
-		s := strconv.Itoa(i)
-		score, ok := zset2[s]
-		assert.Must(ok)
-		assert.Must(math.Abs(score+float64(i)) < 1e-10)
+}
+
+func BenchmarkListIterator(b *testing.B) {
+	databases := loadFromFile("list_decode.rdb")
+	defer release(databases)
+	b.ResetTimer()
+	var iter *rdb.RedisListIterator
+	defer func() {
+		if iter != nil {
+			iter.Release()
+		}
+	}()
+	for i := 0; i < b.N; i++ {
+	try_again:
+		if iter == nil {
+			iter = databases[0]["list"].Value.AsList().NewIterator()
+			goto try_again
+		}
+		if sds := iter.Next(); sds == nil {
+			iter.Release()
+			iter = nil
+			goto try_again
+		} else {
+			sds.StringUnsafe()
+		}
 	}
 }

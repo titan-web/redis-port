@@ -1,235 +1,140 @@
-// Copyright 2016 CodisLabs. All Rights Reserved.
-// Licensed under the MIT (MIT-LICENSE.txt) license.
-
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/CodisLabs/redis-port/pkg/libs/atomic2"
-	"github.com/CodisLabs/redis-port/pkg/libs/log"
-	"github.com/CodisLabs/redis-port/pkg/rdb"
+	"github.com/CodisLabs/codis/pkg/utils/bytesize"
+	"github.com/CodisLabs/codis/pkg/utils/log"
+	"github.com/CodisLabs/codis/pkg/utils/sync2/atomic2"
 )
 
-type cmdDecode struct {
-	rbytes, wbytes, nentry atomic2.Int64
-}
+func main() {
+	const usage = `
+Usage:
+	redis-decode [--ncpu=N] [--input=INPUT|INPUT] [--output=OUTPUT]
+	redis-decode  --version
 
-type cmdDecodeStat struct {
-	rbytes, wbytes, nentry int64
-}
+Options:
+	-n N, --ncpu=N                    Set runtime.GOMAXPROCS to N.
+	-i INPUT, --input=INPUT           Set input rdb encoded file.  [default: /dev/stdin].
+	-o OUTPUT, --output=OUTPUT        Set output file. [default: /dev/stdout].
 
-func (cmd *cmdDecode) Stat() *cmdDecodeStat {
-	return &cmdDecodeStat{
-		rbytes: cmd.rbytes.Get(),
-		wbytes: cmd.wbytes.Get(),
-		nentry: cmd.nentry.Get(),
+Examples:
+	$ redis-decode -i dump.rdb -o dump.log
+	$ redis-decode    dump.rdb -o dump.log
+	$ cat dump.rdb | redis-decode --ncpu=8 > dump.log
+`
+	var flags = parseFlags(usage)
+
+	var input struct {
+		Path string
+		Size int64
+		io.Reader
+		rd io.Reader
+
+		rbytes atomic2.Int64
 	}
-}
-
-func (cmd *cmdDecode) Main() {
-	input, output := args.input, args.output
-	if len(input) == 0 {
-		input = "/dev/stdin"
-	}
-	if len(output) == 0 {
-		output = "/dev/stdout"
+	input.Path = flags.Source
+	if len(input.Path) == 0 {
+		log.Panicf("invalid input file")
 	}
 
-	log.Infof("decode from '%s' to '%s'\n", input, output)
+	var output struct {
+		Path string
+		io.Writer
+		wt *bufio.Writer
 
-	var readin io.ReadCloser
-	var nsize int64
-	if input != "/dev/stdin" {
-		readin, nsize = openReadFile(input)
-		defer readin.Close()
+		wbytes atomic2.Int64
+	}
+	output.Path = flags.Target
+	if len(output.Path) == 0 {
+		log.Panicf("invalid output file")
+	}
+	log.Infof("decode: input = %q, output = %q\n", input.Path, output.Path)
+
+	var objects atomic2.Int64
+
+	if input.Path != "/dev/stdin" {
+		file, size := openReadFile(input.Path)
+		defer file.Close()
+		input.Reader, input.Size = file, size
 	} else {
-		readin, nsize = os.Stdin, 0
+		input.Reader = os.Stdin
 	}
+	input.rd = rBuilder(input.Reader).Must().
+		Buffer(ReaderBufferSize).Count(&input.rbytes).Reader
 
-	var saveto io.WriteCloser
-	if output != "/dev/stdout" {
-		saveto = openWriteFile(output)
-		defer saveto.Close()
+	if output.Path != "/dev/stdout" {
+		file := openWriteFile(output.Path)
+		defer closeFile(file)
+		output.Writer = file
 	} else {
-		saveto = os.Stdout
+		output.Writer = os.Stdout
 	}
+	output.wt = wBuilder(output.Writer).Must().
+		Count(&output.wbytes).Buffer(WriterBufferSize).Writer.(*bufio.Writer)
 
-	reader := bufio.NewReaderSize(readin, ReaderBufferSize)
-	writer := bufio.NewWriterSize(saveto, WriterBufferSize)
+	var mu sync.Mutex
 
-	ipipe := newRDBLoader(reader, &cmd.rbytes, args.parallel*32)
-	opipe := make(chan string, cap(ipipe))
+	var entryChan = newRDBLoader(input.rd, 32)
 
-	go func() {
-		defer close(opipe)
-		group := make(chan int, args.parallel)
-		for i := 0; i < cap(group); i++ {
-			go func() {
-				defer func() {
-					group <- 0
-				}()
-				cmd.decoderMain(ipipe, opipe)
-			}()
+	var jobs = NewParallelJob(flags.Parallel, func() {
+		for e := range entryChan {
+			synchronized(&mu, func() {
+				objects.Incr()
+				toJsonDBEntry(e, output.wt)
+			})
+			e.DecrRefCount()
 		}
-		for i := 0; i < cap(group); i++ {
-			<-group
-		}
-	}()
+	}).Run()
 
-	wait := make(chan struct{})
-	go func() {
-		defer close(wait)
-		for s := range opipe {
-			cmd.wbytes.Add(int64(len(s)))
-			if _, err := writer.WriteString(s); err != nil {
-				log.PanicError(err, "write string failed")
+	var done = NewJob(func() {
+		for stop := false; !stop; {
+			select {
+			case <-jobs:
+				stop = true
+			case <-time.After(time.Second):
 			}
-			flushWriter(writer)
+			synchronized(&mu, func() {
+				flushWriter(output.wt)
+			})
 		}
-	}()
+	}).Run()
 
-	for done := false; !done; {
-		select {
-		case <-wait:
-			done = true
-		case <-time.After(time.Second):
-		}
-		stat := cmd.Stat()
-		var b bytes.Buffer
-		fmt.Fprintf(&b, "decode: ")
-		if nsize != 0 {
-			fmt.Fprintf(&b, "total = %d - %12d [%3d%%]", nsize, stat.rbytes, 100*stat.rbytes/nsize)
-		} else {
-			fmt.Fprintf(&b, "total = %12d", stat.rbytes)
-		}
-		fmt.Fprintf(&b, "  write=%-12d", stat.wbytes)
-		fmt.Fprintf(&b, "  entry=%-12d", stat.nentry)
-		log.Info(b.String())
-	}
-	log.Info("decode: done")
-}
+	log.Infof("decode: (r,w,o) = (read,write,objects)")
 
-func (cmd *cmdDecode) decoderMain(ipipe <-chan *rdb.BinEntry, opipe chan<- string) {
-	toText := func(p []byte) string {
-		var b bytes.Buffer
-		for _, c := range p {
-			switch {
-			case c >= '#' && c <= '~':
-				b.WriteByte(c)
-			default:
-				b.WriteByte('.')
+	NewJob(func() {
+		for stop := false; !stop; {
+			select {
+			case <-done:
+				stop = true
+			case <-time.After(time.Second):
 			}
-		}
-		return b.String()
-	}
-	toBase64 := func(p []byte) string {
-		return base64.StdEncoding.EncodeToString(p)
-	}
-	toJson := func(o interface{}) string {
-		b, err := json.Marshal(o)
-		if err != nil {
-			log.PanicError(err, "encode to json failed")
-		}
-		return string(b)
-	}
-	for e := range ipipe {
-		o, err := rdb.DecodeDump(e.Value)
-		if err != nil {
-			log.PanicError(err, "decode failed")
-		}
-		var b bytes.Buffer
-		switch obj := o.(type) {
-		default:
-			log.Panicf("unknown object %v", o)
-		case rdb.String:
-			o := &struct {
-				DB       uint32 `json:"db"`
-				Type     string `json:"type"`
-				ExpireAt uint64 `json:"expireat"`
-				Key      string `json:"key"`
-				Key64    string `json:"key64"`
-				Value64  string `json:"value64"`
+			stats := &struct {
+				input, output, objects int64
 			}{
-				e.DB, "string", e.ExpireAt, toText(e.Key), toBase64(e.Key),
-				toBase64(obj),
+				input.rbytes.Int64(), output.wbytes.Int64(), objects.Int64(),
 			}
-			fmt.Fprintf(&b, "%s\n", toJson(o))
-		case rdb.List:
-			for i, ele := range obj {
-				o := &struct {
-					DB       uint32 `json:"db"`
-					Type     string `json:"type"`
-					ExpireAt uint64 `json:"expireat"`
-					Key      string `json:"key"`
-					Key64    string `json:"key64"`
-					Index    int    `json:"index"`
-					Value64  string `json:"value64"`
-				}{
-					e.DB, "list", e.ExpireAt, toText(e.Key), toBase64(e.Key),
-					i, toBase64(ele),
-				}
-				fmt.Fprintf(&b, "%s\n", toJson(o))
+
+			var b bytes.Buffer
+			var percent float64
+			if input.Size != 0 {
+				percent = float64(stats.input) * 100 / float64(input.Size)
 			}
-		case rdb.Hash:
-			for _, ele := range obj {
-				o := &struct {
-					DB       uint32 `json:"db"`
-					Type     string `json:"type"`
-					ExpireAt uint64 `json:"expireat"`
-					Key      string `json:"key"`
-					Key64    string `json:"key64"`
-					Field    string `json:"field"`
-					Field64  string `json:"field64"`
-					Value64  string `json:"value64"`
-				}{
-					e.DB, "hash", e.ExpireAt, toText(e.Key), toBase64(e.Key),
-					toText(ele.Field), toBase64(ele.Field), toBase64(ele.Value),
-				}
-				fmt.Fprintf(&b, "%s\n", toJson(o))
-			}
-		case rdb.Set:
-			for _, mem := range obj {
-				o := &struct {
-					DB       uint32 `json:"db"`
-					Type     string `json:"type"`
-					ExpireAt uint64 `json:"expireat"`
-					Key      string `json:"key"`
-					Key64    string `json:"key64"`
-					Member   string `json:"member"`
-					Member64 string `json:"member64"`
-				}{
-					e.DB, "set", e.ExpireAt, toText(e.Key), toBase64(e.Key),
-					toText(mem), toBase64(mem),
-				}
-				fmt.Fprintf(&b, "%s\n", toJson(o))
-			}
-		case rdb.ZSet:
-			for _, ele := range obj {
-				o := &struct {
-					DB       uint32  `json:"db"`
-					Type     string  `json:"type"`
-					ExpireAt uint64  `json:"expireat"`
-					Key      string  `json:"key"`
-					Key64    string  `json:"key64"`
-					Member   string  `json:"member"`
-					Member64 string  `json:"member64"`
-					Score    float64 `json:"score"`
-				}{
-					e.DB, "zset", e.ExpireAt, toText(e.Key), toBase64(e.Key),
-					toText(ele.Member), toBase64(ele.Member), ele.Score,
-				}
-				fmt.Fprintf(&b, "%s\n", toJson(o))
-			}
+			fmt.Fprintf(&b, "decode: file = %d - [%6.2f%%]", input.Size, percent)
+			fmt.Fprintf(&b, "   (r,w,o)=%s",
+				formatAlign(4, "(%d,%d,%d)", stats.input, stats.output, stats.objects))
+			fmt.Fprintf(&b, "  ~  (%s,%s,-)",
+				bytesize.Int64(stats.input).HumanString(), bytesize.Int64(stats.output).HumanString())
+			log.Info(b.String())
 		}
-		cmd.nentry.Incr()
-		opipe <- b.String()
-	}
+	}).RunAndWait()
+
+	log.Info("decode: done")
 }
